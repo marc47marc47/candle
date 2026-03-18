@@ -2,12 +2,17 @@ use super::utils::{
     get_scale_min_k4, group_for_dequantization, group_for_quantization, make_q3_quants,
     make_qkx1_quants, make_qx_quants, nearest_int,
 };
+#[path = "iquant_tables.rs"]
+mod iquant_tables;
 use super::GgmlDType;
 use crate::quantized::utils::{make_qkx3_quants, make_qp_quants};
 use crate::Result;
 use byteorder::{ByteOrder, LittleEndian};
 use half::{bf16, f16, slice::HalfFloatSliceExt};
 use rayon::prelude::*;
+use self::iquant_tables::{
+    IQ2S_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS,
+};
 
 // Default to QK_K 256 rather than 64.
 pub const QK_K: usize = 256;
@@ -19,6 +24,8 @@ pub const QK5_0: usize = 32;
 pub const QK5_1: usize = 32;
 pub const QK8_0: usize = 32;
 pub const QK8_1: usize = 32;
+pub const QK4_NL: usize = 32;
+pub const IQ3S_N_SCALE: usize = QK_K / 64;
 
 pub trait GgmlType: Sized + Clone + Send + Sync {
     const DTYPE: GgmlDType;
@@ -169,6 +176,93 @@ pub struct BlockQ8K {
 }
 const _: () = assert!(4 + QK_K + QK_K / 16 * 2 == std::mem::size_of::<BlockQ8K>());
 
+// Skeleton i-quant block types. The real storage layout and dequantization paths
+// still need to be implemented before these can be loaded for inference.
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
+pub struct BlockIQ1S {
+    pub(crate) _reserved: [u8; 0],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
+pub struct BlockIQ1M {
+    pub(crate) _reserved: [u8; 0],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
+pub struct BlockIQ2XXS {
+    pub(crate) d: f16,
+    pub(crate) qs: [u16; QK_K / 8],
+}
+
+const _: () = assert!(std::mem::size_of::<BlockIQ2XXS>() == 2 + (QK_K / 8) * 2);
+
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
+pub struct BlockIQ2XS {
+    pub(crate) _reserved: [u8; 0],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
+pub struct BlockIQ2S {
+    pub(crate) d: f16,
+    pub(crate) qs: [u8; QK_K / 4],
+    pub(crate) qh: [u8; QK_K / 32],
+    pub(crate) scales: [u8; QK_K / 32],
+}
+
+const _: () = assert!(std::mem::size_of::<BlockIQ2S>() == 2 + QK_K / 4 + QK_K / 16);
+
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
+pub struct BlockIQ3XXS {
+    pub(crate) d: f16,
+    pub(crate) qs: [u8; 3 * QK_K / 8],
+}
+
+const _: () = assert!(std::mem::size_of::<BlockIQ3XXS>() == 2 + 3 * QK_K / 8);
+
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
+pub struct BlockIQ3S {
+    pub(crate) d: f16,
+    pub(crate) qs: [u8; QK_K / 4],
+    pub(crate) qh: [u8; QK_K / 32],
+    pub(crate) signs: [u8; QK_K / 8],
+    pub(crate) scales: [u8; IQ3S_N_SCALE],
+}
+
+const _: () =
+    assert!(std::mem::size_of::<BlockIQ3S>() == 2 + QK_K / 4 + QK_K / 32 + QK_K / 8 + IQ3S_N_SCALE);
+
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
+pub struct BlockIQ4NL {
+    pub(crate) d: f16,
+    pub(crate) qs: [u8; QK4_NL / 2],
+}
+
+const _: () = assert!(std::mem::size_of::<BlockIQ4NL>() == 18);
+
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
+pub struct BlockIQ4XS {
+    pub(crate) d: f16,
+    pub(crate) scales_h: u16,
+    pub(crate) scales_l: [u8; QK_K / 64],
+    pub(crate) qs: [u8; QK_K / 2],
+}
+
+const _: () =
+    assert!(std::mem::size_of::<BlockIQ4XS>() == 2 + 2 + QK_K / 64 + QK_K / 2);
+
+const KVALUES_IQ4NL: [i8; 16] = [
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+];
+
 impl GgmlType for BlockQ4_0 {
     const DTYPE: GgmlDType = GgmlDType::Q4_0;
     const BLCK_SIZE: usize = QK4_0;
@@ -267,6 +361,413 @@ impl GgmlType for BlockQ4_0 {
             sumf += sum_i as f32 * f16::to_f32(xs.d) * f16::to_f32(ys.d)
         }
         sumf
+    }
+}
+
+impl GgmlType for BlockIQ4NL {
+    const DTYPE: GgmlDType = GgmlDType::IQ4NL;
+    const BLCK_SIZE: usize = QK4_NL;
+    type VecDotType = BlockQ8_0;
+
+    fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        Self::vec_dot_unopt(n, xs, ys)
+    }
+
+    fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        debug_assert!(
+            n.is_multiple_of(QK4_NL),
+            "vec_dot_iq4_nl_q8_0: {n} is not divisible by {QK4_NL}"
+        );
+        let mut sumf = 0f32;
+        for (xs, ys) in xs.iter().zip(ys.iter()) {
+            let mut sum_i = 0i32;
+            for j in 0..QK4_NL / 2 {
+                let v0 = KVALUES_IQ4NL[(xs.qs[j] & 0x0f) as usize] as i32;
+                let v1 = KVALUES_IQ4NL[(xs.qs[j] >> 4) as usize] as i32;
+                sum_i += v0 * ys.qs[j] as i32 + v1 * ys.qs[j + QK4_NL / 2] as i32;
+            }
+            sumf += sum_i as f32 * xs.d.to_f32() * ys.d.to_f32();
+        }
+        sumf
+    }
+
+    fn from_float(_xs: &[f32], _ys: &mut [Self]) {
+        panic!("quantization to IQ4_NL is not implemented yet");
+    }
+
+    fn to_float(xs: &[Self], ys: &mut [f32]) {
+        let k = ys.len();
+        debug_assert!(
+            k.is_multiple_of(QK4_NL),
+            "dequantize_row_iq4_nl: {k} is not divisible by {QK4_NL}"
+        );
+
+        let nb = k / QK4_NL;
+        for i in 0..nb {
+            let d = xs[i].d.to_f32();
+            for j in 0..QK4_NL / 2 {
+                ys[i * QK4_NL + j] = d * KVALUES_IQ4NL[(xs[i].qs[j] & 0x0f) as usize] as f32;
+                ys[i * QK4_NL + j + QK4_NL / 2] =
+                    d * KVALUES_IQ4NL[(xs[i].qs[j] >> 4) as usize] as f32;
+            }
+        }
+    }
+}
+
+impl GgmlType for BlockIQ4XS {
+    const DTYPE: GgmlDType = GgmlDType::IQ4XS;
+    const BLCK_SIZE: usize = QK_K;
+    type VecDotType = BlockQ8K;
+
+    fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        Self::vec_dot_unopt(n, xs, ys)
+    }
+
+    fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        debug_assert!(
+            n.is_multiple_of(QK_K),
+            "vec_dot_iq4_xs_q8k: {n} is not divisible by {QK_K}"
+        );
+        let mut lhs = vec![0f32; QK_K];
+        let mut rhs = vec![0f32; QK_K];
+        let mut sum = 0f32;
+        for (x, y) in xs.iter().zip(ys.iter()) {
+            Self::to_float(std::slice::from_ref(x), &mut lhs);
+            BlockQ8K::to_float(std::slice::from_ref(y), &mut rhs);
+            sum += lhs.iter().zip(rhs.iter()).map(|(l, r)| l * r).sum::<f32>();
+        }
+        sum
+    }
+
+    fn from_float(_xs: &[f32], _ys: &mut [Self]) {
+        panic!("quantization to IQ4_XS is not implemented yet");
+    }
+
+    fn to_float(xs: &[Self], ys: &mut [f32]) {
+        let k = ys.len();
+        debug_assert!(
+            k.is_multiple_of(QK_K),
+            "dequantize_row_iq4_xs: {k} is not divisible by {QK_K}"
+        );
+
+        let nb = k / QK_K;
+        for i in 0..nb {
+            let mut y_offset = i * QK_K;
+            let mut qs_offset = 0usize;
+            let d = xs[i].d.to_f32();
+            for ib in 0..QK_K / 32 {
+                let ls = ((xs[i].scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0f) as i32
+                    | ((((xs[i].scales_h >> (2 * ib)) & 0x03) as i32) << 4);
+                let dl = d * (ls - 32) as f32;
+                for j in 0..16 {
+                    ys[y_offset + j] = dl * KVALUES_IQ4NL[(xs[i].qs[qs_offset + j] & 0x0f) as usize] as f32;
+                    ys[y_offset + j + 16] =
+                        dl * KVALUES_IQ4NL[(xs[i].qs[qs_offset + j] >> 4) as usize] as f32;
+                }
+                y_offset += 32;
+                qs_offset += 16;
+            }
+        }
+    }
+}
+
+impl GgmlType for BlockIQ3S {
+    const DTYPE: GgmlDType = GgmlDType::IQ3S;
+    const BLCK_SIZE: usize = QK_K;
+    type VecDotType = BlockQ8K;
+
+    fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        Self::vec_dot_unopt(n, xs, ys)
+    }
+
+    fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        debug_assert!(
+            n.is_multiple_of(QK_K),
+            "vec_dot_iq3_s_q8k: {n} is not divisible by {QK_K}"
+        );
+        let mut lhs = vec![0f32; QK_K];
+        let mut rhs = vec![0f32; QK_K];
+        let mut sum = 0f32;
+        for (x, y) in xs.iter().zip(ys.iter()) {
+            Self::to_float(std::slice::from_ref(x), &mut lhs);
+            BlockQ8K::to_float(std::slice::from_ref(y), &mut rhs);
+            sum += lhs.iter().zip(rhs.iter()).map(|(l, r)| l * r).sum::<f32>();
+        }
+        sum
+    }
+
+    fn from_float(_xs: &[f32], _ys: &mut [Self]) {
+        panic!("quantization to IQ3_S is not implemented yet");
+    }
+
+    fn to_float(xs: &[Self], ys: &mut [f32]) {
+        let k = ys.len();
+        debug_assert!(
+            k.is_multiple_of(QK_K),
+            "dequantize_row_iq3_s: {k} is not divisible by {QK_K}"
+        );
+
+        let nb = k / QK_K;
+        for i in 0..nb {
+            let mut y_offset = i * QK_K;
+            let mut qs_offset = 0usize;
+            let mut signs_offset = 0usize;
+            let mut qh_offset = 0usize;
+            let d = xs[i].d.to_f32();
+
+            for ib32 in (0..QK_K / 32).step_by(2) {
+                let db1 = d * (1 + 2 * ((xs[i].scales[ib32 / 2] & 0x0f) as i32)) as f32;
+                let db2 = d * (1 + 2 * ((xs[i].scales[ib32 / 2] >> 4) as i32)) as f32;
+
+                for l in 0..4 {
+                    let grid1_idx =
+                        (xs[i].qs[qs_offset + 2 * l] as usize)
+                            | ((((xs[i].qh[qh_offset] as usize) << (8 - 2 * l)) & 256) as usize);
+                    let grid2_idx =
+                        (xs[i].qs[qs_offset + 2 * l + 1] as usize)
+                            | ((((xs[i].qh[qh_offset] as usize) << (7 - 2 * l)) & 256) as usize);
+                    let grid1 = IQ3S_GRID[grid1_idx];
+                    let grid2 = IQ3S_GRID[grid2_idx];
+                    let signs = xs[i].signs[signs_offset + l];
+
+                    for j in 0..4 {
+                        let v1 = ((grid1 >> (8 * j)) & 0xff) as f32;
+                        let v2 = ((grid2 >> (8 * j)) & 0xff) as f32;
+                        let s1 = if (signs & KMASK_IQ2XS[j]) != 0 { -1.0 } else { 1.0 };
+                        let s2 = if (signs & KMASK_IQ2XS[j + 4]) != 0 { -1.0 } else { 1.0 };
+                        ys[y_offset + j] = db1 * v1 * s1;
+                        ys[y_offset + j + 4] = db1 * v2 * s2;
+                    }
+                    y_offset += 8;
+                }
+
+                qs_offset += 8;
+                signs_offset += 4;
+
+                for l in 0..4 {
+                    let grid1_idx =
+                        (xs[i].qs[qs_offset + 2 * l] as usize)
+                            | ((((xs[i].qh[qh_offset + 1] as usize) << (8 - 2 * l)) & 256)
+                                as usize);
+                    let grid2_idx =
+                        (xs[i].qs[qs_offset + 2 * l + 1] as usize)
+                            | ((((xs[i].qh[qh_offset + 1] as usize) << (7 - 2 * l)) & 256)
+                                as usize);
+                    let grid1 = IQ3S_GRID[grid1_idx];
+                    let grid2 = IQ3S_GRID[grid2_idx];
+                    let signs = xs[i].signs[signs_offset + l];
+
+                    for j in 0..4 {
+                        let v1 = ((grid1 >> (8 * j)) & 0xff) as f32;
+                        let v2 = ((grid2 >> (8 * j)) & 0xff) as f32;
+                        let s1 = if (signs & KMASK_IQ2XS[j]) != 0 { -1.0 } else { 1.0 };
+                        let s2 = if (signs & KMASK_IQ2XS[j + 4]) != 0 { -1.0 } else { 1.0 };
+                        ys[y_offset + j] = db2 * v1 * s1;
+                        ys[y_offset + j + 4] = db2 * v2 * s2;
+                    }
+                    y_offset += 8;
+                }
+
+                qh_offset += 2;
+                qs_offset += 8;
+                signs_offset += 4;
+            }
+        }
+    }
+}
+
+impl GgmlType for BlockIQ3XXS {
+    const DTYPE: GgmlDType = GgmlDType::IQ3XXS;
+    const BLCK_SIZE: usize = QK_K;
+    type VecDotType = BlockQ8K;
+
+    fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        Self::vec_dot_unopt(n, xs, ys)
+    }
+
+    fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        debug_assert!(
+            n.is_multiple_of(QK_K),
+            "vec_dot_iq3_xxs_q8k: {n} is not divisible by {QK_K}"
+        );
+        let mut lhs = vec![0f32; QK_K];
+        let mut rhs = vec![0f32; QK_K];
+        let mut sum = 0f32;
+        for (x, y) in xs.iter().zip(ys.iter()) {
+            Self::to_float(std::slice::from_ref(x), &mut lhs);
+            BlockQ8K::to_float(std::slice::from_ref(y), &mut rhs);
+            sum += lhs.iter().zip(rhs.iter()).map(|(l, r)| l * r).sum::<f32>();
+        }
+        sum
+    }
+
+    fn from_float(_xs: &[f32], _ys: &mut [Self]) {
+        panic!("quantization to IQ3_XXS is not implemented yet");
+    }
+
+    fn to_float(xs: &[Self], ys: &mut [f32]) {
+        let k = ys.len();
+        debug_assert!(
+            k.is_multiple_of(QK_K),
+            "dequantize_row_iq3_xxs: {k} is not divisible by {QK_K}"
+        );
+
+        let nb = k / QK_K;
+        for i in 0..nb {
+            let d = xs[i].d.to_f32();
+            let mut y_offset = i * QK_K;
+
+            for ib32 in 0..QK_K / 32 {
+                let aux = LittleEndian::read_u32(&xs[i].qs[QK_K / 4 + 4 * ib32..QK_K / 4 + 4 * ib32 + 4]);
+                let db = d * (0.5 + ((aux >> 28) as f32)) * 0.5;
+
+                for l in 0..4 {
+                    let signs = KSIGNS_IQ2XS[((aux >> (7 * l)) & 127) as usize];
+                    let grid1 = IQ3XXS_GRID[xs[i].qs[8 * ib32 + 2 * l] as usize];
+                    let grid2 = IQ3XXS_GRID[xs[i].qs[8 * ib32 + 2 * l + 1] as usize];
+
+                    for j in 0..4 {
+                        let v1 = ((grid1 >> (8 * j)) & 0xff) as f32;
+                        let v2 = ((grid2 >> (8 * j)) & 0xff) as f32;
+                        let s1 = if (signs & KMASK_IQ2XS[j]) != 0 { -1.0 } else { 1.0 };
+                        let s2 = if (signs & KMASK_IQ2XS[j + 4]) != 0 { -1.0 } else { 1.0 };
+                        ys[y_offset + j] = db * v1 * s1;
+                        ys[y_offset + j + 4] = db * v2 * s2;
+                    }
+                    y_offset += 8;
+                }
+            }
+        }
+    }
+}
+
+impl GgmlType for BlockIQ2S {
+    const DTYPE: GgmlDType = GgmlDType::IQ2S;
+    const BLCK_SIZE: usize = QK_K;
+    type VecDotType = BlockQ8K;
+
+    fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        Self::vec_dot_unopt(n, xs, ys)
+    }
+
+    fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        debug_assert!(
+            n.is_multiple_of(QK_K),
+            "vec_dot_iq2_s_q8k: {n} is not divisible by {QK_K}"
+        );
+        let mut lhs = vec![0f32; QK_K];
+        let mut rhs = vec![0f32; QK_K];
+        let mut sum = 0f32;
+        for (x, y) in xs.iter().zip(ys.iter()) {
+            Self::to_float(std::slice::from_ref(x), &mut lhs);
+            BlockQ8K::to_float(std::slice::from_ref(y), &mut rhs);
+            sum += lhs.iter().zip(rhs.iter()).map(|(l, r)| l * r).sum::<f32>();
+        }
+        sum
+    }
+
+    fn from_float(_xs: &[f32], _ys: &mut [Self]) {
+        panic!("quantization to IQ2_S is not implemented yet");
+    }
+
+    fn to_float(xs: &[Self], ys: &mut [f32]) {
+        let k = ys.len();
+        debug_assert!(
+            k.is_multiple_of(QK_K),
+            "dequantize_row_iq2_s: {k} is not divisible by {QK_K}"
+        );
+
+        let nb = k / QK_K;
+        for i in 0..nb {
+            let d = xs[i].d.to_f32();
+            let mut y_offset = i * QK_K;
+
+            for ib32 in 0..QK_K / 32 {
+                let db0 = d * (0.5 + ((xs[i].scales[ib32] & 0x0f) as f32)) * 0.25;
+                let db1 = d * (0.5 + ((xs[i].scales[ib32] >> 4) as f32)) * 0.25;
+
+                for l in 0..4 {
+                    let dl = if l < 2 { db0 } else { db1 };
+                    let grid_idx = (xs[i].qs[4 * ib32 + l] as usize)
+                        | ((((xs[i].qh[ib32] as usize) << (8 - 2 * l)) & 0x300) as usize);
+                    let grid = IQ2S_GRID[grid_idx];
+                    let signs = xs[i].qs[QK_K / 8 + 4 * ib32 + l];
+
+                    for j in 0..8 {
+                        let v = ((grid >> (8 * j)) & 0xff) as f32;
+                        let s = if (signs & KMASK_IQ2XS[j]) != 0 { -1.0 } else { 1.0 };
+                        ys[y_offset + j] = dl * v * s;
+                    }
+                    y_offset += 8;
+                }
+            }
+        }
+    }
+}
+
+impl GgmlType for BlockIQ2XXS {
+    const DTYPE: GgmlDType = GgmlDType::IQ2XXS;
+    const BLCK_SIZE: usize = QK_K;
+    type VecDotType = BlockQ8K;
+
+    fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        Self::vec_dot_unopt(n, xs, ys)
+    }
+
+    fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        debug_assert!(
+            n.is_multiple_of(QK_K),
+            "vec_dot_iq2_xxs_q8k: {n} is not divisible by {QK_K}"
+        );
+        let mut lhs = vec![0f32; QK_K];
+        let mut rhs = vec![0f32; QK_K];
+        let mut sum = 0f32;
+        for (x, y) in xs.iter().zip(ys.iter()) {
+            Self::to_float(std::slice::from_ref(x), &mut lhs);
+            BlockQ8K::to_float(std::slice::from_ref(y), &mut rhs);
+            sum += lhs.iter().zip(rhs.iter()).map(|(l, r)| l * r).sum::<f32>();
+        }
+        sum
+    }
+
+    fn from_float(_xs: &[f32], _ys: &mut [Self]) {
+        panic!("quantization to IQ2_XXS is not implemented yet");
+    }
+
+    fn to_float(xs: &[Self], ys: &mut [f32]) {
+        let k = ys.len();
+        debug_assert!(
+            k.is_multiple_of(QK_K),
+            "dequantize_row_iq2_xxs: {k} is not divisible by {QK_K}"
+        );
+
+        let nb = k / QK_K;
+        for i in 0..nb {
+            let d = xs[i].d.to_f32();
+            let mut y_offset = i * QK_K;
+
+            for ib32 in 0..QK_K / 32 {
+                let mut bytes = [0u8; 8];
+                for j in 0..4 {
+                    let word = xs[i].qs[4 * ib32 + j];
+                    bytes[2 * j] = (word & 0xff) as u8;
+                    bytes[2 * j + 1] = (word >> 8) as u8;
+                }
+                let aux_hi = LittleEndian::read_u32(&bytes[4..8]);
+                let db = d * (0.5 + ((aux_hi >> 28) as f32)) * 0.25;
+
+                for l in 0..4 {
+                    let grid = IQ2XXS_GRID[bytes[l] as usize];
+                    let signs = KSIGNS_IQ2XS[((aux_hi >> (7 * l)) & 127) as usize];
+                    for j in 0..8 {
+                        let v = ((grid >> (8 * j)) & 0xff) as f32;
+                        let s = if (signs & KMASK_IQ2XS[j]) != 0 { -1.0 } else { 1.0 };
+                        ys[y_offset + j] = db * v * s;
+                    }
+                    y_offset += 8;
+                }
+            }
+        }
     }
 }
 

@@ -101,6 +101,7 @@ impl QStorage {
                 GgmlDType::Q6K => metal::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
                 GgmlDType::Q8K => metal::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => metal::load_quantized(d, as_t_slice::<bf16>(data)),
+                _ => crate::bail!("metal loading is not implemented yet for {dtype:?}"),
             },
             Device::Cuda(d) => match dtype {
                 GgmlDType::F32 => cuda::load_quantized(d, as_t_slice::<f32>(data)),
@@ -118,6 +119,7 @@ impl QStorage {
                 GgmlDType::Q6K => cuda::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
                 GgmlDType::Q8K => cuda::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
+                _ => crate::bail!("cuda loading is not implemented yet for {dtype:?}"),
             },
         }
     }
@@ -268,6 +270,15 @@ pub enum GgmlDType {
     Q5K,
     Q6K,
     Q8K,
+    IQ1S,
+    IQ1M,
+    IQ2XXS,
+    IQ2XS,
+    IQ2S,
+    IQ3XXS,
+    IQ3S,
+    IQ4NL,
+    IQ4XS,
 }
 
 impl GgmlDType {
@@ -287,6 +298,15 @@ impl GgmlDType {
             13 => Self::Q5K,
             14 => Self::Q6K,
             15 => Self::Q8K,
+            16 => Self::IQ2XXS,
+            17 => Self::IQ2XS,
+            18 => Self::IQ3XXS,
+            19 => Self::IQ1S,
+            20 => Self::IQ4NL,
+            21 => Self::IQ3S,
+            22 => Self::IQ2S,
+            23 => Self::IQ4XS,
+            29 => Self::IQ1M,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             30 => Self::BF16,
             _ => crate::bail!("unknown dtype for tensor {u}"),
@@ -310,6 +330,15 @@ impl GgmlDType {
             Self::Q5K => 13,
             Self::Q6K => 14,
             Self::Q8K => 15,
+            Self::IQ2XXS => 16,
+            Self::IQ2XS => 17,
+            Self::IQ3XXS => 18,
+            Self::IQ1S => 19,
+            Self::IQ4NL => 20,
+            Self::IQ3S => 21,
+            Self::IQ2S => 22,
+            Self::IQ4XS => 23,
+            Self::IQ1M => 29,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             Self::BF16 => 30,
         }
@@ -332,6 +361,29 @@ impl GgmlDType {
             Self::Q5K => Box::new(vec![BlockQ5K::zeros(); elem_count / BlockQ5K::BLCK_SIZE]),
             Self::Q6K => Box::new(vec![BlockQ6K::zeros(); elem_count / BlockQ6K::BLCK_SIZE]),
             Self::Q8K => Box::new(vec![BlockQ8K::zeros(); elem_count / BlockQ8K::BLCK_SIZE]),
+            Self::IQ2XXS => {
+                Box::new(vec![BlockIQ2XXS::zeros(); elem_count / BlockIQ2XXS::BLCK_SIZE])
+            }
+            Self::IQ2S => {
+                Box::new(vec![BlockIQ2S::zeros(); elem_count / BlockIQ2S::BLCK_SIZE])
+            }
+            Self::IQ3XXS => {
+                Box::new(vec![BlockIQ3XXS::zeros(); elem_count / BlockIQ3XXS::BLCK_SIZE])
+            }
+            Self::IQ3S => {
+                Box::new(vec![BlockIQ3S::zeros(); elem_count / BlockIQ3S::BLCK_SIZE])
+            }
+            Self::IQ4NL => {
+                Box::new(vec![BlockIQ4NL::zeros(); elem_count / BlockIQ4NL::BLCK_SIZE])
+            }
+            Self::IQ4XS => {
+                Box::new(vec![BlockIQ4XS::zeros(); elem_count / BlockIQ4XS::BLCK_SIZE])
+            }
+            Self::IQ1S
+            | Self::IQ1M
+            | Self::IQ2XS => {
+                panic!("cpu_zeros is not implemented yet for {self:?}")
+            }
             Self::BF16 => Box::new(vec![bf16::zeros(); elem_count]),
         }
     }
@@ -352,6 +404,17 @@ impl GgmlDType {
             Self::Q5K => Box::new(as_t_slice::<BlockQ5K>(data).to_vec()),
             Self::Q6K => Box::new(as_t_slice::<BlockQ6K>(data).to_vec()),
             Self::Q8K => Box::new(as_t_slice::<BlockQ8K>(data).to_vec()),
+            Self::IQ2XXS => Box::new(as_t_slice::<BlockIQ2XXS>(data).to_vec()),
+            Self::IQ2S => Box::new(as_t_slice::<BlockIQ2S>(data).to_vec()),
+            Self::IQ3XXS => Box::new(as_t_slice::<BlockIQ3XXS>(data).to_vec()),
+            Self::IQ3S => Box::new(as_t_slice::<BlockIQ3S>(data).to_vec()),
+            Self::IQ4NL => Box::new(as_t_slice::<BlockIQ4NL>(data).to_vec()),
+            Self::IQ4XS => Box::new(as_t_slice::<BlockIQ4XS>(data).to_vec()),
+            Self::IQ1S
+            | Self::IQ1M
+            | Self::IQ2XS => {
+                panic!("from_data is not implemented yet for {self:?}")
+            }
             Self::BF16 => Box::new(as_t_slice::<bf16>(data).to_vec()),
         }
     }
@@ -375,6 +438,15 @@ impl GgmlDType {
             Self::Q5K => std::mem::size_of::<BlockQ5K>(),
             Self::Q6K => std::mem::size_of::<BlockQ6K>(),
             Self::Q8K => std::mem::size_of::<BlockQ8K>(),
+            Self::IQ2XXS => std::mem::size_of::<BlockIQ2XXS>(),
+            Self::IQ2S => std::mem::size_of::<BlockIQ2S>(),
+            Self::IQ3XXS => std::mem::size_of::<BlockIQ3XXS>(),
+            Self::IQ3S => std::mem::size_of::<BlockIQ3S>(),
+            Self::IQ4NL => std::mem::size_of::<BlockIQ4NL>(),
+            Self::IQ4XS => std::mem::size_of::<BlockIQ4XS>(),
+            Self::IQ1S
+            | Self::IQ1M
+            | Self::IQ2XS => panic!("type_size is not implemented yet for {self:?}"),
         }
     }
 
@@ -390,6 +462,15 @@ impl GgmlDType {
             Self::Q8_0 => k_quants::QK8_0,
             Self::Q8_1 => k_quants::QK8_1,
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => k_quants::QK_K,
+            Self::IQ2XXS => k_quants::QK_K,
+            Self::IQ2S => k_quants::QK_K,
+            Self::IQ3XXS => k_quants::QK_K,
+            Self::IQ3S => k_quants::QK_K,
+            Self::IQ4NL => k_quants::QK4_NL,
+            Self::IQ4XS => k_quants::QK_K,
+            Self::IQ1S
+            | Self::IQ1M
+            | Self::IQ2XS => panic!("block_size is not implemented yet for {self:?}"),
         }
     }
 }

@@ -596,6 +596,20 @@ impl QCudaStorage {
             GgmlDType::Q5K => deq::<crate::quantized::BlockQ5K>(&buffer, block_len, &mut out),
             GgmlDType::Q6K => deq::<crate::quantized::BlockQ6K>(&buffer, block_len, &mut out),
             GgmlDType::Q8K => deq::<crate::quantized::BlockQ8K>(&buffer, block_len, &mut out),
+            GgmlDType::IQ1S
+            | GgmlDType::IQ1M
+            | GgmlDType::IQ2XXS
+            | GgmlDType::IQ2XS
+            | GgmlDType::IQ2S
+            | GgmlDType::IQ3XXS
+            | GgmlDType::IQ3S
+            | GgmlDType::IQ4NL
+            | GgmlDType::IQ4XS => {
+                crate::bail!(
+                    "cuda dequantization is not implemented yet for {:?}; use --cpu for this i-quant format",
+                    self.dtype
+                )
+            }
         }
 
         self.device
